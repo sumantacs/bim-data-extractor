@@ -148,25 +148,95 @@ class GoogleProvider(ProviderBase):
 
 
 class OpenAIProvider(ProviderBase):
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model_name: Optional[str] = None):
+        # Import heavy OCR dependencies lazily and surface helpful error messages
         try:
             import openai
+            import pytesseract
+            from pdf2image import convert_from_path
+            from PIL import Image, ImageOps, ImageFilter
         except Exception as e:
-            raise RuntimeError(f"openai package is not installed: {e}")
+            raise RuntimeError(f"OpenAI/OCR dependencies missing: {e}")
+
         self.openai = openai
         self.openai.api_key = api_key
+        self.pytesseract = pytesseract
+        self.convert_from_path = convert_from_path
+        self.Image = Image
+        self.ImageOps = ImageOps
+        self.ImageFilter = ImageFilter
+        # allow selecting model via env var or param
+        self.model_name = model_name or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     def upload_file(self, path: str):
-        # NOTE: OpenAI usage for images/PDFs/vision requires a different flow (Vision API / multipart uploads).
-        # Here we return the local path as a reference. Implementors should extend this to a proper upload
-        # flow or pass file bytes to a vision-enabled model.
+        # The provider uses local path processing (OCR). Return the path as the file reference.
         return path
 
+    def _image_to_text(self, image_path: str) -> str:
+        img = self.Image.open(image_path)
+        # Basic preprocessing: convert to grayscale, attempt inversion for better contrast, and denoise
+        try:
+            img = img.convert("L")
+            img = self.ImageOps.autocontrast(img)
+            img = img.filter(self.ImageFilter.MedianFilter(size=3))
+        except Exception:
+            pass
+        text = self.pytesseract.image_to_string(img)
+        return text
+
+    def _pdf_to_text(self, pdf_path: str) -> str:
+        pages = self.convert_from_path(pdf_path, dpi=300)
+        texts = []
+        for page_img in pages:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                page_img.save(tmp.name, format="PNG")
+                try:
+                    texts.append(self._image_to_text(tmp.name))
+                finally:
+                    try:
+                        os.remove(tmp.name)
+                    except Exception:
+                        pass
+        return "\n\n".join(texts)
+
     def generate_content(self, file_ref: Any, prompt: str) -> str:
-        # This is an intentionally minimal placeholder implementation.
-        # A production implementation would either: (a) upload the file to OpenAI via the appropriate file/uploads API
-        # and reference it in a multimodal request, or (b) run OCR locally and pass extracted text/metadata to the model.
-        raise NotImplementedError("OpenAI provider is a placeholder in this repo. Implement file handling and a multimodal request here.")
+        path = str(file_ref)
+        try:
+            if path.lower().endswith('.pdf'):
+                extracted_text = self._pdf_to_text(path)
+            else:
+                extracted_text = self._image_to_text(path)
+        except Exception as e:
+            raise RuntimeError(f"OCR extraction failed: {e}")
+
+        # Combine OCR text with the structured prompt. Include clear markers to help the model.
+        user_input = (
+            "-----BEGIN_EXTRACTED_TEXT-----\n"
+            f"{extracted_text}\n"
+            "-----END_EXTRACTED_TEXT-----\n\n"
+            f"{prompt}"
+        )
+
+        try:
+            resp = self.openai.ChatCompletion.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": user_input}],
+                temperature=0.0,
+                max_tokens=2000,
+            )
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API call failed: {e}")
+
+        # Extract text from response (compatible with multiple shapes)
+        try:
+            text = resp.choices[0].message.content
+        except Exception:
+            try:
+                text = resp.choices[0].text
+            except Exception:
+                text = str(resp)
+
+        return text
 
 
 # --- Helper utilities ---
