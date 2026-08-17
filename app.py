@@ -1,5 +1,4 @@
 import streamlit as st
-import google.generativeai as genai
 import os
 import tempfile
 import json
@@ -8,6 +7,8 @@ import concurrent.futures
 import traceback
 from typing import Any, Dict, Optional
 from concurrent.futures import as_completed
+
+# Optional provider imports (imported inside classes to keep failures local)
 
 # --- App Configuration ---
 st.set_page_config(page_title="BIM Data Extractor", page_icon="🏗️", layout="wide")
@@ -27,21 +28,14 @@ else:
 if not api_key:
     st.warning("Provide your Gemini API Key via Streamlit secrets or GEMINI_API_KEY env var to proceed.")
 
-# configure client once
-if api_key:
-    try:
-        genai.configure(api_key=api_key)
-    except Exception as e:
-        st.error(f"Failed to configure Gemini client: {e}")
+# Provider selection (pluggable adapter)
+PROVIDER_GOOGLE = "google"
+PROVIDER_OPENAI = "openai"
+provider_choice = st.sidebar.selectbox("AI provider:", (PROVIDER_GOOGLE, PROVIDER_OPENAI), index=0, format_func=lambda x: "Google Gemini" if x == PROVIDER_GOOGLE else "OpenAI (experimental)")
 
-# Initialize model once (lazy - only if configured)
+# configure model/provider once (lazy)
 MODEL_NAME = 'gemini-1.5-pro-latest'
-model = None
-if api_key:
-    try:
-        model = genai.GenerativeModel(MODEL_NAME)
-    except Exception as e:
-        st.error(f"Failed to initialize model {MODEL_NAME}: {e}")
+provider = None
 
 # --- Prompts ---
 JSON_PROMPT_TEMPLATE = '''
@@ -69,6 +63,112 @@ Review the attached design document carefully. Extract the following information
 Accuracy is critical. If a measurement is unclear, state "Unclear" rather than guessing.
 '''
 
+# --- JSON Schema for validation ---
+try:
+    import jsonschema
+    from jsonschema import validate
+except Exception:
+    jsonschema = None
+
+JSON_SCHEMA = {
+    "type": "object",
+    "required": ["document_summary", "key_dimensions", "structural_elements", "materials_annotations", "confidence_issues"],
+    "additionalProperties": False,
+    "properties": {
+        "document_summary": {"type": "string"},
+        "key_dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "value"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "null"}]},
+                    "units": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "location_hint": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                },
+                "additionalProperties": False
+            }
+        },
+        "structural_elements": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                    "type": {"type": "string"},
+                    "location": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "notes": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                },
+                "additionalProperties": False
+            }
+        },
+        "materials_annotations": {"type": "array", "items": {"type": "string"}},
+        "confidence_issues": {"type": "array", "items": {"type": "string"}}
+    }
+}
+
+# --- Provider adapters ---
+class ProviderBase:
+    def upload_file(self, path: str):
+        raise NotImplementedError()
+
+    def generate_content(self, file_ref: Any, prompt: str) -> str:
+        raise NotImplementedError()
+
+
+class GoogleProvider(ProviderBase):
+    def __init__(self, api_key: str, model_name: str):
+        try:
+            import google.generativeai as genai
+        except Exception as e:
+            raise RuntimeError(f"google-generativeai is not available: {e}")
+        self.genai = genai
+        try:
+            genai.configure(api_key=api_key)
+        except Exception as e:
+            # genai.configure may raise if key invalid; surface later in UI
+            pass
+        try:
+            self.model = genai.GenerativeModel(model_name)
+        except Exception:
+            # model initialization deferred; model calls will surface errors
+            self.model = None
+
+    def upload_file(self, path: str):
+        # wrap genai.upload_file with retries handled by caller
+        return self.genai.upload_file(path=path)
+
+    def generate_content(self, file_ref: Any, prompt: str) -> str:
+        if not self.model:
+            # try lazy init
+            self.model = self.genai.GenerativeModel(MODEL_NAME)
+        resp = self.model.generate_content([file_ref, prompt])
+        return getattr(resp, "text", str(resp))
+
+
+class OpenAIProvider(ProviderBase):
+    def __init__(self, api_key: str):
+        try:
+            import openai
+        except Exception as e:
+            raise RuntimeError(f"openai package is not installed: {e}")
+        self.openai = openai
+        self.openai.api_key = api_key
+
+    def upload_file(self, path: str):
+        # NOTE: OpenAI usage for images/PDFs/vision requires a different flow (Vision API / multipart uploads).
+        # Here we return the local path as a reference. Implementors should extend this to a proper upload
+        # flow or pass file bytes to a vision-enabled model.
+        return path
+
+    def generate_content(self, file_ref: Any, prompt: str) -> str:
+        # This is an intentionally minimal placeholder implementation.
+        # A production implementation would either: (a) upload the file to OpenAI via the appropriate file/uploads API
+        # and reference it in a multimodal request, or (b) run OCR locally and pass extracted text/metadata to the model.
+        raise NotImplementedError("OpenAI provider is a placeholder in this repo. Implement file handling and a multimodal request here.")
+
+
 # --- Helper utilities ---
 
 def retry_call(fn, *args, retries=3, backoff=2, **kwargs):
@@ -85,7 +185,7 @@ def retry_call(fn, *args, retries=3, backoff=2, **kwargs):
                 raise
 
 
-def process_single_file(uploaded_file, prompt_mode: str, model_instance) -> Dict[str, Any]:
+def process_single_file(uploaded_file, prompt_mode: str, provider_instance: ProviderBase) -> Dict[str, Any]:
     status: Dict[str, Any] = {"filename": uploaded_file.name, "success": False, "output": None, "error": None}
     tmp_path = None
     try:
@@ -97,7 +197,7 @@ def process_single_file(uploaded_file, prompt_mode: str, model_instance) -> Dict
 
         # Upload file with retries
         try:
-            gemini_file = retry_call(genai.upload_file, path=tmp_path, retries=3, backoff=2)
+            file_ref = retry_call(provider_instance.upload_file, tmp_path, retries=3, backoff=2)
         except Exception as e:
             status["error"] = f"upload_file failed: {str(e)}"
             return status
@@ -110,17 +210,29 @@ def process_single_file(uploaded_file, prompt_mode: str, model_instance) -> Dict
 
         # Generate content with retries
         try:
-            resp = retry_call(model_instance.generate_content, [gemini_file, prompt], retries=3, backoff=2)
+            resp_text = retry_call(provider_instance.generate_content, file_ref, prompt, retries=3, backoff=2)
+        except NotImplementedError as nie:
+            status["error"] = f"provider not implemented: {str(nie)}"
+            return status
         except Exception as e:
             status["error"] = f"generate_content failed: {str(e)}"
             return status
 
-        text = getattr(resp, "text", str(resp))
+        text = resp_text
 
         if prompt_mode == "json":
             # Try strict JSON parse
             try:
                 parsed = json.loads(text)
+                # Validate against schema if jsonschema available
+                if jsonschema:
+                    try:
+                        validate(instance=parsed, schema=JSON_SCHEMA)
+                    except Exception as e:
+                        status["output"] = parsed
+                        status["error"] = f"schema validation failed: {e}"
+                        status["success"] = False
+                        return status
                 status["output"] = parsed
                 status["success"] = True
             except Exception:
@@ -130,6 +242,14 @@ def process_single_file(uploaded_file, prompt_mode: str, model_instance) -> Dict
                     end = text.rfind('}')
                     if start != -1 and end != -1 and end > start:
                         parsed = json.loads(text[start:end+1])
+                        if jsonschema:
+                            try:
+                                validate(instance=parsed, schema=JSON_SCHEMA)
+                            except Exception as e:
+                                status["output"] = parsed
+                                status["error"] = f"schema validation failed after extraction: {e}"
+                                status["success"] = False
+                                return status
                         status["output"] = parsed
                         status["success"] = True
                     else:
@@ -162,12 +282,26 @@ def process_single_file(uploaded_file, prompt_mode: str, model_instance) -> Dict
 st.sidebar.header("Batch settings")
 prompt_mode = st.sidebar.radio("Output format:", ("json", "markdown"), index=0, format_func=lambda x: "Strict JSON" if x == "json" else "Human-readable Markdown")
 max_workers = st.sidebar.slider("Parallel workers", min_value=1, max_value=8, value=3)
-
 st.sidebar.markdown("Retries and backoff are handled internally (default 3 attempts, exponential backoff).")
+
+# Create provider instance (show user-facing errors if provider not available)
+if provider_choice == PROVIDER_GOOGLE:
+    try:
+        provider = GoogleProvider(api_key, MODEL_NAME) if api_key else None
+    except Exception as e:
+        provider = None
+        st.error(f"Failed to initialize Google provider: {e}")
+elif provider_choice == PROVIDER_OPENAI:
+    try:
+        provider = OpenAIProvider(api_key) if api_key else None
+        st.warning("OpenAI provider is experimental — file handling and multimodal requests are not implemented by default.")
+    except Exception as e:
+        provider = None
+        st.error(f"Failed to initialize OpenAI provider: {e}")
 
 uploaded_files = st.file_uploader("Upload blueprints (multiple allowed)", type=['pdf', 'jpg', 'jpeg', 'png'], accept_multiple_files=True)
 
-if uploaded_files and api_key and model:
+if uploaded_files and api_key and provider:
     if st.button("Run batch extraction"):
         total = len(uploaded_files)
         progress_bar = st.progress(0)
@@ -177,7 +311,7 @@ if uploaded_files and api_key and model:
 
         # Run tasks in ThreadPoolExecutor and collect futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_name = {executor.submit(process_single_file, f, prompt_mode, model): f.name for f in uploaded_files}
+            future_to_name = {executor.submit(process_single_file, f, prompt_mode, provider): f.name for f in uploaded_files}
 
             completed = 0
             for future in as_completed(future_to_name):
@@ -220,5 +354,5 @@ else:
         st.info("Upload one or more PDF/image files to enable batch extraction.")
     elif not api_key:
         st.warning("Provide your Gemini API Key via Streamlit secrets or GEMINI_API_KEY env var to proceed.")
-    elif not model:
-        st.warning("Model not initialized; check your Gemini configuration and API key.")
+    elif not provider:
+        st.warning("Provider not initialized; check your provider selection and API key.")
