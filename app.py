@@ -8,8 +8,22 @@ st.set_page_config(page_title="BIM Data Extractor", page_icon="🏗️", layout=
 st.title("🏗️ Civil Engineering BIM Extractor")
 st.write("Upload a modern PDF design or a scanned old paper blueprint to extract structural dimensions, lengths, widths, and materials.")
 
-# --- API Key Setup ---
-api_key = st.text_input("Enter your Gemini API Key:", type="password")
+# --- API Key Setup (secure) ---
+# Preferred: Streamlit secrets (recommended for sharing apps)
+# Fallback: environment variable GEMINI_API_KEY
+# Optional insecure fallback: manual input (only for quick local testing)
+api_key = None
+# 1) Streamlit secrets (add to .streamlit/secrets.toml as GEMINI_API_KEY = "your_key")
+if st.secrets.get("GEMINI_API_KEY"):
+    api_key = st.secrets.get("GEMINI_API_KEY")
+# 2) Environment variable
+elif os.getenv("GEMINI_API_KEY"):
+    api_key = os.getenv("GEMINI_API_KEY")
+# 3) Insecure fallback for quick testing
+else:
+    st.info("No Gemini API key found in Streamlit secrets or the GEMINI_API_KEY environment variable. For secure storage, add GEMINI_API_KEY to Streamlit secrets (recommended) or set the GEMINI_API_KEY environment variable.")
+    api_key = st.text_input("Enter your Gemini API Key (insecure, for testing only):", type="password")
+
 if api_key:
     genai.configure(api_key=api_key)
 
@@ -61,4 +75,4 @@ if uploaded_file and api_key:
             except Exception as e:
                 st.error(f"An error occurred during extraction: {e}")
 elif not api_key:
-    st.warning("Please enter your Gemini API Key to proceed.")
+    st.warning("Please provide your Gemini API Key via Streamlit secrets or the GEMINI_API_KEY environment variable to proceed.")
